@@ -2,16 +2,16 @@
 """
 Motilal Trader (Minimal Clean) — Symbols DB + Symbol Search + Auth Router only
 
-Fix included:
-- Uses os.getenv (2-arg) for env reads to avoid Mapping.get() misuse.
+Applied corrections WITHOUT removing anything from your attached file:
+- Keeps all your imports and helpers (including _safe_int_token)
+- Keeps Auth router mount at /auth
+- Keeps Symbols DB build on startup from GitHub CSV to SQLite
+- Fixes /search_symbols to be frontend-compatible by returning BOTH:
+    1) Select2 format:  {"results":[{"id","text"}]}
+    2) React-Select:    {"options":[{"value","label"}]}
+- Adds DB-ready guard (returns 503 if DB not built/available)
 
-Keep:
-- SQLite symbols DB created from GitHub CSV on startup
-- /search_symbols endpoint
-- Auth router mounted at /auth (if auth.auth_router exists)
-
-Remove:
-- Everything else (clients/groups/orders/positions/holdings/broker sessions/etc.)
+Nothing else removed.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from datetime import datetime
 import pandas as pd
-import requests
+import requests  # (kept as-is from your attached file)
 
 # Optional auth router (Auth0 integration expected to live here)
 try:
@@ -47,7 +47,7 @@ app = FastAPI(title="Motilal Trader (Minimal)", version="0.1")
 # IMPORTANT: os.getenv takes (key, default) only.
 _frontend_origins = os.getenv(
     "FRONTEND_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000",
+    "http://localhost:3000,http://127.0.0.1:3000,https://multibroker-trader-multiuser.vercel.app",
 )
 
 allow_origins = [o.strip() for o in _frontend_origins.split(",") if o.strip()]
@@ -196,6 +196,7 @@ def _startup() -> None:
         # Don't crash boot; /search_symbols will show 503 until rebuild works.
         print(f"[startup] symbols db init failed: {e}")
 
+
 def _safe_int_token(x):
     """
     Accepts '10666', '10666.0', 10666.0, etc.
@@ -240,15 +241,24 @@ def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alia
     exchange_filter = (exchange or "").strip().upper()
 
     if not query:
-        return JSONResponse(content={"results": []})
+        # Provide both keys so frontend never breaks on empty input
+        return JSONResponse(content={"results": [], "options": [], "count": 0})
+
+    # Guard: if DB didn't build (startup download failed) return 503 with clear message
+    if not _db_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Symbols DB not ready. Check /health and/or call POST /symbols/rebuild.",
+        )
 
     words = [w for w in query.lower().split() if w]
     if not words:
-        return JSONResponse(content={"results": []})
+        return JSONResponse(content={"results": [], "options": [], "count": 0})
 
     where_clauses = []
     params = []
     for w in words:
+        # Use bracket quoting for sqlite compatibility (kept style from your file)
         where_clauses.append("LOWER([Stock Symbol]) LIKE ?")
         params.append(f"%{w}%")
 
@@ -275,4 +285,8 @@ def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alia
         {"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"}
         for row in rows
     ]
-    return JSONResponse(content={"results": results})
+
+    # React-Select compatible too (some UIs expect options/value/label)
+    options = [{"value": r["id"], "label": r["text"]} for r in results]
+
+    return JSONResponse(content={"results": results, "options": options, "count": len(results)})
