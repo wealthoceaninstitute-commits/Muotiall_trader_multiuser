@@ -23,9 +23,13 @@ import threading
 from typing import Any, Dict, List
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, Request, Body, Query, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from datetime import datetime
+import pandas as pd
+import requests
 
 # Optional auth router (Auth0 integration expected to live here)
 try:
@@ -192,6 +196,21 @@ def _startup() -> None:
         # Don't crash boot; /search_symbols will show 503 until rebuild works.
         print(f"[startup] symbols db init failed: {e}")
 
+def _safe_int_token(x):
+    """
+    Accepts '10666', '10666.0', 10666.0, etc.
+    Returns int or raises HTTPException(400) with a clear message.
+    """
+    try:
+        if x is None:
+            raise ValueError("symboltoken is None")
+        s = str(x).strip()
+        if s == "":
+            raise ValueError("symboltoken is empty")
+        return int(float(s))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid symboltoken: {x}")
+
 
 ###############################################################################
 # Basic endpoints
@@ -216,35 +235,21 @@ def rebuild_symbols() -> Dict[str, Any]:
 ###############################################################################
 
 @app.get("/search_symbols")
-def search_symbols(
-    q: str = Query("", alias="q"),
-    exchange: str = Query("", alias="exchange"),
-) -> JSONResponse:
-    """
-    Returns:
-      { "results": [ { "id": "NSE|TCS|11536", "text": "NSE | TCS" }, ... ] }
-    """
+def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alias="exchange")):
     query = (q or "").strip()
     exchange_filter = (exchange or "").strip().upper()
 
     if not query:
         return JSONResponse(content={"results": []})
 
-    if not _db_ready():
-        raise HTTPException(
-            status_code=503,
-            detail="Symbols DB not ready. Check /health and/or call POST /symbols/rebuild.",
-        )
-
     words = [w for w in query.lower().split() if w]
     if not words:
         return JSONResponse(content={"results": []})
 
-    where_clauses: List[str] = []
-    params: List[Any] = []
-
+    where_clauses = []
+    params = []
     for w in words:
-        where_clauses.append('LOWER("Stock Symbol") LIKE ?')
+        where_clauses.append("LOWER([Stock Symbol]) LIKE ?")
         params.append(f"%{w}%")
 
     where_sql = " AND ".join(where_clauses)
@@ -253,10 +258,10 @@ def search_symbols(
         params.append(exchange_filter)
 
     sql = f"""
-        SELECT Exchange, "Stock Symbol", "Security ID"
+        SELECT Exchange, [Stock Symbol], [Security ID]
         FROM {TABLE_NAME}
         WHERE {where_sql}
-        ORDER BY "Stock Symbol"
+        ORDER BY [Stock Symbol]
         LIMIT 20
     """
 
@@ -266,5 +271,8 @@ def search_symbols(
         rows = cur.fetchall()
         conn.close()
 
-    results = [{"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"} for row in rows]
+    results = [
+        {"id": f"{row[0]}|{row[1]}|{row[2]}", "text": f"{row[0]} | {row[1]}"}
+        for row in rows
+    ]
     return JSONResponse(content={"results": results})
