@@ -1,20 +1,17 @@
-# motilal_trader_minimal.py
+# motilal_trader.py
 """
 Motilal Trader (Minimal Clean) — Symbols DB + Symbol Search + Auth Router only
 
-Kept from your v1.1 backend:
+Fix included:
+- Uses os.getenv (2-arg) for env reads to avoid Mapping.get() misuse.
+
+Keep:
 - SQLite symbols DB created from GitHub CSV on startup
-- /search_symbols endpoint (used by frontend dropdown / search)
-- Auth router mounted (your Auth0 integration via auth.auth_router), if present
+- /search_symbols endpoint
+- Auth router mounted at /auth (if auth.auth_router exists)
 
-Removed:
-- Clients, groups, copy trading, orders, positions, holdings, any Motilal SDK session logic
-
-Notes
-- This backend still expects the symbol master CSV at:
-    https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv
-- If your auth_router already validates Auth0 and returns the logged-in user,
-  you can keep using it unchanged.
+Remove:
+- Everything else (clients/groups/orders/positions/holdings/broker sessions/etc.)
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ import csv
 import os
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -43,11 +40,12 @@ except Exception:
 
 app = FastAPI(title="Motilal Trader (Minimal)", version="0.1")
 
-_frontend_origins = os.environ.get(
+# IMPORTANT: os.getenv takes (key, default) only.
+_frontend_origins = os.getenv(
     "FRONTEND_ORIGINS",
     "http://localhost:3000,http://127.0.0.1:3000",
-    "https://multibroker-trader-multiuser.vercel.app"
 )
+
 allow_origins = [o.strip() for o in _frontend_origins.split(",") if o.strip()]
 if len(allow_origins) == 1 and allow_origins[0] == "*":
     allow_origins = ["*"]
@@ -61,7 +59,6 @@ app.add_middleware(
 )
 
 # Mount auth router if present
-# (Keeps your Auth0 login endpoints exactly as-is)
 if auth_router is not None:
     app.include_router(auth_router, prefix="/auth")
 
@@ -70,13 +67,13 @@ if auth_router is not None:
 # Symbol DB config
 ###############################################################################
 
-GITHUB_CSV_URL = os.environ.get(
+GITHUB_CSV_URL = os.getenv(
     "SYMBOLS_CSV_URL",
     "https://raw.githubusercontent.com/Pramod541988/Stock_List/main/security_id.csv",
 )
 
-SQLITE_DB = os.environ.get("SYMBOLS_DB_PATH", "symbols.db")
-TABLE_NAME = os.environ.get("SYMBOLS_TABLE", "symbols")
+SQLITE_DB = os.getenv("SYMBOLS_DB_PATH", "symbols.db")
+TABLE_NAME = os.getenv("SYMBOLS_TABLE", "symbols")
 symbol_db_lock = threading.Lock()
 
 
@@ -85,7 +82,6 @@ symbol_db_lock = threading.Lock()
 ###############################################################################
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    # We create a fresh table each rebuild; but this helps validate an existing DB.
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -101,7 +97,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 def recreate_sqlite_from_csv() -> Dict[str, Any]:
     """
     Recreate symbols.db from the GitHub CSV (or configured URL).
-    Uses stdlib csv to keep deps minimal.
     Expects columns at least: Exchange, Stock Symbol, Security ID
     """
     try:
@@ -110,16 +105,15 @@ def recreate_sqlite_from_csv() -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to download symbols CSV: {e}")
 
-    csv_text = r.text.splitlines()
-    if not csv_text:
+    csv_lines = r.text.splitlines()
+    if not csv_lines:
         raise RuntimeError("Symbols CSV is empty.")
 
-    reader = csv.DictReader(csv_text)
+    reader = csv.DictReader(csv_lines)
     required = {"Exchange", "Stock Symbol", "Security ID"}
     if not required.issubset(set(reader.fieldnames or [])):
         raise RuntimeError(f"CSV missing required columns. Found: {reader.fieldnames}")
 
-    # Build new DB atomically-ish: write to temp then replace
     tmp_db = SQLITE_DB + ".tmp"
 
     if os.path.exists(tmp_db):
@@ -178,7 +172,10 @@ def _db_ready() -> bool:
             return False
         conn = sqlite3.connect(SQLITE_DB)
         _ensure_schema(conn)
-        cur = conn.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE_NAME,))
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (TABLE_NAME,),
+        )
         ok = cur.fetchone() is not None
         conn.close()
         return ok
@@ -188,11 +185,11 @@ def _db_ready() -> bool:
 
 @app.on_event("startup")
 def _startup() -> None:
-    # Build symbol DB at startup. If it fails, search endpoint will return a friendly error.
     try:
         with symbol_db_lock:
             recreate_sqlite_from_csv()
     except Exception as e:
+        # Don't crash boot; /search_symbols will show 503 until rebuild works.
         print(f"[startup] symbols db init failed: {e}")
 
 
@@ -207,9 +204,6 @@ def health() -> Dict[str, Any]:
 
 @app.post("/symbols/rebuild")
 def rebuild_symbols() -> Dict[str, Any]:
-    """
-    Manual rebuild endpoint (useful after you update the CSV in GitHub).
-    """
     try:
         with symbol_db_lock:
             return recreate_sqlite_from_csv()
@@ -218,7 +212,7 @@ def rebuild_symbols() -> Dict[str, Any]:
 
 
 ###############################################################################
-# Symbols search (for frontend select)
+# Symbols search
 ###############################################################################
 
 @app.get("/search_symbols")
