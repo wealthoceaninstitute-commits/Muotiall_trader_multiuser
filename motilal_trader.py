@@ -24,12 +24,16 @@ from typing import Any, Dict, List
 
 import requests
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, Request, Body, Query, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Body, Query, Form, HTTPException, BackgroundTasks,Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from datetime import datetime
 import pandas as pd
 import requests  # (kept as-is from your attached file)
+import base64
+import json
+import re
+
 
 # Optional auth router (Auth0 integration expected to live here)
 try:
@@ -290,3 +294,199 @@ def search_symbols(q: str = Query("", alias="q"), exchange: str = Query("", alia
     options = [{"value": r["id"], "label": r["text"]} for r in results]
 
     return JSONResponse(content={"results": results, "options": options, "count": len(results)})
+
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "").strip()
+GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+
+# Root folder in repo that contains "users/...". In your screenshot it's "data/users/..."
+GITHUB_DATA_ROOT = os.getenv("GITHUB_DATA_ROOT", "data").strip().strip("/") or "data"
+
+def _github_enabled() -> bool:
+    return bool(GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN)
+
+def _gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "motilal-trader",
+    }
+
+def _gh_api_url(path: str) -> str:
+    path = path.lstrip("/")
+    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{path}"
+
+def _github_get(path: str) -> Dict[str, Any]:
+    """
+    GET a GitHub 'contents' API object.
+    Returns dict or {"__not_found__": True} if missing.
+    """
+    if not _github_enabled():
+        raise HTTPException(status_code=500, detail="GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN).")
+    url = _gh_api_url(path)
+    try:
+        r = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=30)
+        if r.status_code == 404:
+            return {"__not_found__": True}
+        r.raise_for_status()
+        j = r.json()
+        return j if isinstance(j, dict) else {"__list__": j}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GitHub GET failed: {e}")
+
+def _github_put(path: str, content_bytes: bytes, message: str) -> Dict[str, Any]:
+    """
+    Create/update a file in GitHub at 'path' (repo-relative).
+    """
+    if not _github_enabled():
+        raise HTTPException(status_code=500, detail="GitHub storage not configured (set GITHUB_OWNER/GITHUB_REPO/GITHUB_TOKEN).")
+
+    # check existing to obtain sha (required for updates)
+    existing = _github_get(path)
+    sha = None
+    if isinstance(existing, dict) and existing.get("__not_found__"):
+        sha = None
+    elif isinstance(existing, dict) and existing.get("sha"):
+        sha = existing.get("sha")
+
+    payload: Dict[str, Any] = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    url = _gh_api_url(path)
+    try:
+        r = requests.put(url, headers=_gh_headers(), json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GitHub PUT failed: {e}")
+
+def _github_list_dir(path: str) -> List[Dict[str, Any]]:
+    """
+    List a directory using GitHub contents API. Returns [] if not found.
+    """
+    obj = _github_get(path)
+    if isinstance(obj, dict) and obj.get("__not_found__"):
+        return []
+    if isinstance(obj, dict) and "__list__" in obj and isinstance(obj["__list__"], list):
+        return obj["__list__"]
+    return []
+
+def _github_read_json(path: str) -> Dict[str, Any]:
+    obj = _github_get(path)
+    if isinstance(obj, dict) and obj.get("__not_found__"):
+        return {}
+    if not isinstance(obj, dict) or "content" not in obj:
+        return {}
+    try:
+        raw = base64.b64decode((obj.get("content") or "").encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+def _github_write_json(path: str, data: Dict[str, Any], message: str) -> None:
+    b = (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _github_put(path, b, message=message)
+
+def _safe(s: Any) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s or "").strip())
+
+def _pick(*vals: Any) -> str:
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+def require_user(user_id: str) -> str:
+    uid = (user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Missing X-User-Id header (logged in user).")
+    return uid
+
+def _client_rel_path(user_id: str, client_id: str) -> str:
+    # repo path: data/users/<user>/clients/motilal/<client>.json
+    return f"{GITHUB_DATA_ROOT}/users/{_safe(user_id)}/clients/motilal/{_safe(client_id)}.json"
+
+def _client_dir(user_id: str) -> str:
+    return f"{GITHUB_DATA_ROOT}/users/{_safe(user_id)}/clients/motilal"
+
+@app.post("/add_client")
+async def add_client(
+    payload: Dict[str, Any] = Body(...),
+    user_id: str = Header("", alias="X-User-Id"),
+) -> Dict[str, Any]:
+    """
+    Save a Motilal client for the logged-in user into GitHub.
+    Reference fields from CT_FastAPI: name, userid, password, pan, apikey, totpkey, capital, session_active. fileciteturn4file4L1-L22
+    """
+    uid = require_user(user_id)
+
+    client_id = _pick(payload.get("userid"), payload.get("client_id"))
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id/userid required")
+
+    display_name = (payload.get("name") or payload.get("display_name") or client_id).strip()
+
+    doc = dict(payload)
+    doc["broker"] = "motilal"
+    doc["userid"] = client_id
+    doc["name"] = display_name
+    doc.setdefault("session_active", False)
+    doc.setdefault("created_at", datetime.utcnow().isoformat())
+    doc["updated_at"] = datetime.utcnow().isoformat()
+
+    rel = _client_rel_path(uid, client_id)
+    _github_write_json(rel, doc, message=f"Add/Update client {client_id} for {uid}")
+
+    return {"success": True, "message": "Client saved to GitHub.", "client_id": client_id}
+
+@app.get("/get_clients")
+def get_clients(
+    user_id: str = Header("", alias="X-User-Id"),
+) -> Dict[str, Any]:
+    """
+    Load clients for logged-in user from GitHub.
+    UI fields follow CT_FastAPI get_clients response: name, client_id, capital, session. fileciteturn4file4L25-L46
+    """
+    uid = require_user(user_id)
+
+    out: List[Dict[str, Any]] = []
+    dir_path = _client_dir(uid)
+    for it in _github_list_dir(dir_path):
+        if it.get("type") != "file":
+            continue
+        fn = it.get("name") or ""
+        if not fn.endswith(".json"):
+            continue
+
+        doc = _github_read_json(f"{dir_path}/{fn}") or {}
+        if not isinstance(doc, dict):
+            continue
+
+        client_id = str(doc.get("userid") or doc.get("client_id") or "").strip()
+        session_status = "Logged in" if bool(doc.get("session_active")) else "pending"
+
+        out.append(
+            {
+                "name": doc.get("name", "") or doc.get("display_name", ""),
+                "client_id": client_id,
+                "capital": doc.get("capital", "") or "",
+                "session": session_status,
+                "broker": "motilal",
+            }
+        )
+
+    out.sort(key=lambda x: (x.get("name") or "", x.get("client_id") or ""))
+    return {"clients": out}
+
+
