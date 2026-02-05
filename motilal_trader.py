@@ -63,7 +63,7 @@ except Exception:
 # App + CORS
 ###############################################################################
 
-app = FastAPI(title="CT FastAPI WebApp (Motilal Multi-User)", version="1.0")
+app = FastAPI(title="CT FastAPI WebApp (Motilal Multi-User)", version="1.1")
 
 # CORS
 _frontend_origins = os.environ.get(
@@ -358,6 +358,43 @@ def _startup() -> None:
     except Exception as e:
         print(f"[startup] symbols db init failed: {e}")
 
+    # v1.1: restore sessions on startup for clients previously marked session_active=True.
+    # This helps deployments that restart/scale to rebuild in-memory sessions for order placement.
+    def _restore_all_user_sessions() -> None:
+        try:
+            # list users from storage root (works for local; for GitHub we scan by directory listing)
+            # Local scan:
+            user_dirs = []
+            try:
+                if os.path.isdir(USERS_ROOT):
+                    user_dirs = [d for d in os.listdir(USERS_ROOT) if os.path.isdir(os.path.join(USERS_ROOT, d))]
+            except Exception:
+                user_dirs = []
+
+            # If GitHub is enabled, fallback to listing under data/users
+            if _github_enabled():
+                gh_items = _github_list_dir("users") or []
+                for it in gh_items:
+                    if it.get("type") == "dir":
+                        nm = it.get("name")
+                        if nm:
+                            user_dirs.append(nm)
+
+            # de-dup
+            user_dirs = sorted(set([_safe(u) for u in user_dirs if u]))
+
+            for u in user_dirs:
+                rel_dir = f"users/{_safe(u)}/clients/motilal"
+                for fn in _store_list_json(rel_dir):
+                    doc = _store_read_json(f"{rel_dir}/{fn}") or {}
+                    if isinstance(doc, dict) and bool(doc.get("session_active")):
+                        # Re-login to rebuild runtime session cache
+                        login_client(u, doc)
+        except Exception as e:
+            print(f"[startup] restore sessions failed: {e}")
+
+    threading.Thread(target=_restore_all_user_sessions, daemon=True).start()
+
 
 ###############################################################################
 # Helpers: sessions and clients
@@ -589,15 +626,16 @@ async def clients_add(
 def get_clients(
     user_id: str = Header(..., alias="X-User-Id"),
 ) -> Dict[str, Any]:
-    uid = require_user(user_id)
+    """
+    Client list for the logged-in user.
 
-    # Build a fast lookup of client_ids that are currently logged-in (runtime sessions)
-    runtime_logged_in = set()
-    try:
-        for _nm, (_mofsl, cid) in _sessions_for_user(uid).items():
-            runtime_logged_in.add(str(cid))
-    except Exception:
-        pass
+    IMPORTANT (v1.1):
+    - UI session status is driven ONLY by persisted JSON field `session_active`,
+      same as the local CT_FastAPI app.
+    - Runtime in-memory sessions are NOT used to decide UI status, because
+      deployments may restart / scale and lose memory.
+    """
+    uid = require_user(user_id)
 
     rel_dir = f"users/{_safe(uid)}/clients/motilal"
     out: List[Dict[str, Any]] = []
@@ -610,12 +648,8 @@ def get_clients(
 
         client_id = str(d.get("userid", "") or d.get("client_id", "") or "").strip()
 
-        # ✅ Prefer live runtime session (truthy if login already happened)
-        if client_id and client_id in runtime_logged_in:
-            session_status = "Logged in"
-        else:
-            # fallback to persisted flag
-            session_status = "Logged in" if d.get("session_active") else "pending"
+        # ✅ Single source of truth (like local app):
+        session_status = "Logged in" if bool(d.get("session_active")) else "pending"
 
         out.append(
             {
@@ -628,6 +662,7 @@ def get_clients(
         )
 
     return {"clients": out}
+
 
 
 @app.post("/clients/delete")
